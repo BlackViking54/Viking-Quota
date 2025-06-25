@@ -81,7 +81,7 @@ jobs:
 
       - name: Build quota.json
         run: |
-          LIMIT=10
+          LIMIT=4900
           MAX=${{ steps.usage.outputs.max }}
           UNDER=true
           if [ "$MAX" -ge "$LIMIT" ]; then UNDER=false; fi
