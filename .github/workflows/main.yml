@@ -1,0 +1,101 @@
+name: HERE-quota → quota.json
+
+on:
+  schedule:            # every 30 min
+    - cron:  '*/30 * * * *'
+  workflow_dispatch:   # …and manual trigger in Actions tab
+
+jobs:
+  check-here-usage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate HERE OAuth1.0 Token
+        id: token
+        run: |
+          set -euo pipefail
+
+          ACCESS_KEY_ID="${{ secrets.HERE_ACCESS_KEY_ID }}"
+          ACCESS_KEY_SECRET="${{ secrets.HERE_ACCESS_KEY_SECRET }}"
+
+          oauth_consumer_key="$ACCESS_KEY_ID"
+          oauth_nonce=$(uuidgen | tr -d '-')
+          oauth_signature_method="HMAC-SHA256"
+          oauth_timestamp=$(date +%s)
+          oauth_version="1.0"
+          grant_type="client_credentials"
+
+          # Build parameter string
+          param_str="grant_type=${grant_type}&oauth_consumer_key=${oauth_consumer_key}&oauth_nonce=${oauth_nonce}&oauth_signature_method=${oauth_signature_method}&oauth_timestamp=${oauth_timestamp}&oauth_version=${oauth_version}"
+
+          # Sort parameters by key and encode them
+          param_sorted=$(echo "$param_str" | tr '&' '\n' | sort | tr '\n' '&' | sed 's/&$//')
+          param_encoded=$(printf '%s' "$param_sorted" | jq -s -R -r @uri)
+
+          # Create base string
+          base_url="https://account.api.here.com/oauth2/token"
+          base_str="POST&$(printf '%s' "$base_url" | jq -s -R -r @uri)&$param_encoded"
+
+          # Create signing key
+          signing_key="$(printf '%s' "$ACCESS_KEY_SECRET" | jq -s -R -r @uri)&"
+
+          # Sign the base string with HMAC-SHA256, then base64 encode
+          oauth_signature=$(printf '%s' "$base_str" | openssl dgst -sha256 -hmac "$signing_key" -binary | base64)
+
+          # URL encode the signature
+          oauth_signature_enc=$(printf '%s' "$oauth_signature" | jq -s -R -r @uri)
+
+          # Construct the OAuth header
+          auth_header="OAuth oauth_consumer_key=\"$oauth_consumer_key\", oauth_nonce=\"$oauth_nonce\", oauth_signature_method=\"$oauth_signature_method\", oauth_timestamp=\"$oauth_timestamp\", oauth_version=\"$oauth_version\", oauth_signature=\"$oauth_signature_enc\""
+
+          # Request the token
+          response=$(curl -s -w "\n%{http_code}" -X POST "$base_url" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "Authorization: $auth_header" \
+            -d "grant_type=client_credentials")
+
+          body=$(echo "$response" | head -n -1)
+          code=$(echo "$response" | tail -n1)
+
+          if [[ "$code" != "200" ]]; then
+            echo "::error::Failed to get HERE OAuth token"
+            echo "$body"
+            exit 1
+          fi
+
+          token=$(echo "$body" | jq -r .access_token)
+          echo "token=$token" >> $GITHUB_OUTPUT
+
+      - name: Check HERE Usage Quota
+        id: usage
+        run: |
+          start=$(date -u +"%Y-%m-01T00:00:00")
+          end=$(date -u -d "+1 day" +"%Y-%m-%dT00:00:00")
+          resp=$(curl -s -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            "https://usage.bam.api.here.com/v2/usage/realms/${{ secrets.HERE_ORG_ID }}?startDate=$start&endDate=$end&billingTag=${{ secrets.HERE_BILLING_TAG }}")
+          echo "$resp" | jq .
+          max=$(echo "$resp" | jq '[.items[].billableValue // 0 | floor] | max')
+          echo "Max usage this month: $max"
+          echo "max=$max" >> $GITHUB_OUTPUT
+
+
+
+      - name: Build quota.json
+        run: |
+          LIMIT=4900
+          MAX=${{ steps.usage.outputs.max }}
+          UNDER=true
+          if [ "$MAX" -ge "$LIMIT" ]; then UNDER=false; fi
+          cat > quota.json <<EOF
+          { "under_limit": $UNDER, "current": $MAX, "limit": $LIMIT }
+          EOF
+          cat quota.json
+
+
+      - name: Push quota.json to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}   # auto-generated PAT
+          publish_dir: .                              # just quota.json
+          publish_branch: gh-pages
+          keep_files: true
+          commit_message: "Update quota.json [skip ci]"   # prevents loops
